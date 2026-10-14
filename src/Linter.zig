@@ -1034,7 +1034,7 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         // Builtin type constructors
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(node));
-            break :blk isTypeReturningBuiltin(token);
+            break :blk TypeResolver.isTypeReturningBuiltin(token);
         },
         // Identifier referencing another type (type alias)
         .identifier => blk: {
@@ -1164,16 +1164,6 @@ fn isSelfType(self: *Linter, name: []const u8) bool {
     else
         basename;
     return std.mem.eql(u8, name, stem);
-}
-
-/// Builtin calls that always produce a type. Both isTypeExpression (public_types)
-/// and isTypeAlias (Z006) must accept these, so keep the list in one place.
-fn isTypeReturningBuiltin(name: []const u8) bool {
-    const builtins = [_][]const u8{ "@This", "@Type", "@TypeOf", "@Vector", "@Frame", "@Struct", "@Fn" };
-    for (builtins) |b| {
-        if (std.mem.eql(u8, name, b)) return true;
-    }
-    return false;
 }
 
 fn isBuiltinType(name: []const u8) bool {
@@ -3007,7 +2997,7 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
-            break :blk std.mem.eql(u8, token, "@import") or isTypeReturningBuiltin(token);
+            break :blk std.mem.eql(u8, token, "@import") or TypeResolver.isTypeReturningBuiltin(token);
         },
         .call_one, .call_one_comma => blk: {
             // Check if calling a PascalCase function (type constructor)
@@ -3685,6 +3675,59 @@ test "Z006: allow type alias with @TypeOf()" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with @Int" {
+    // 0.16 replaced @Type with fine-grained constructors; @Int is the one
+    // real code hits most (e.g. a vector mask sized by a comptime constant).
+    var linter: Linter = .init(std.testing.allocator,
+        \\const vector_chunk_len = 32;
+        \\const VectorMask = @Int(.unsigned, vector_chunk_len);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with @Pointer, @Enum, @Union, @Fn" {
+    // These take 3+ args, so they exercise the .builtin_call path, not just
+    // .builtin_call_two.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const attrs = .{};
+        \\const SliceT = @Pointer(.slice, attrs, u8, null);
+        \\const LevelT = @Enum(u8, .exhaustive, &.{ "info" }, &.{ 0 });
+        \\const OptT = @Union(.auto, null, &.{ "a" }, &.{ u8 }, &@splat(.{}));
+        \\const FnT = @Fn(.unspecified, .auto, &.{ u8 }, void);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: allow type alias with @Struct, @Tuple, @FieldType, @EnumLiteral" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const RecT = @Struct(.auto, null, &.{ "a" }, &.{ u8 }, &@splat(.{}));
+        \\const PairT = @Tuple(&.{ u8, u16 });
+        \\const base = struct { x: u32 };
+        \\const XT = @FieldType(base, "x");
+        \\const ScopeT = @EnumLiteral();
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: flag PascalCase @typeInfo result" {
+    // @typeInfo returns a std.builtin.Type value, not a type: a PascalCase
+    // binding here is a misnamed variable, not a type alias.
+    var linter: Linter = .init(std.testing.allocator, "const Info = @typeInfo(u8);", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
 }
 
 test "Z006: allow type alias with struct" {

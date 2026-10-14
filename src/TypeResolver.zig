@@ -615,7 +615,7 @@ fn resolveNodeType(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, 
     return switch (tag) {
         .identifier => self.resolveIdentifier(tree, node, module_path),
         .field_access => self.resolveFieldAccess(tree, node, module_path),
-        .builtin_call_two, .builtin_call_two_comma => self.resolveBuiltinCall(tree, node, module_path),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => self.resolveBuiltinCall(tree, node, module_path),
         .call_one, .call_one_comma, .call, .call_comma => self.resolveFunctionCall(tree, node, module_path),
         .number_literal => self.resolveNumberLiteral(tree, node),
         .string_literal, .multiline_string_literal => .{ .slice = .{ .child = &.{ .primitive = .u8 } } },
@@ -955,6 +955,28 @@ fn isStdImportAlias(self: *TypeResolver, tree: *const Ast, name: []const u8) boo
     return false;
 }
 
+/// Builtin calls whose result is a type.
+///
+/// Single source of truth for every builtin-type question: Linter's
+/// syntactic checks (Z006 type aliases, the public-types map) and
+/// resolveBuiltinCall below all read this list. Verified against the 0.16
+/// compiler by probing each name: @Int, @Pointer, @Struct, @Enum, @Union,
+/// @Tuple, @Fn, @FieldType, and @EnumLiteral all exist and return types,
+/// while @Type was removed in 0.16 (kept here so pre-0.16 code lints clean)
+/// and @Float was never accepted. @typeInfo returns a std.builtin.Type
+/// value, not a type, so it must stay out of this list.
+pub fn isTypeReturningBuiltin(name: []const u8) bool {
+    const builtins = [_][]const u8{
+        "@This",  "@TypeOf",  "@Vector",    "@Frame", "@EnumLiteral",
+        "@Int",   "@Pointer", "@Struct",    "@Enum",  "@Union",
+        "@Tuple", "@Fn",      "@FieldType", "@Type",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
 fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
     const main_token = tree.nodeMainToken(node);
     const builtin_name = tree.tokenSlice(main_token);
@@ -994,11 +1016,7 @@ fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
         }
     }
 
-    if (std.mem.eql(u8, builtin_name, "@This")) {
-        return .type_type;
-    }
-
-    if (std.mem.eql(u8, builtin_name, "@TypeOf") or std.mem.eql(u8, builtin_name, "@typeInfo")) {
+    if (isTypeReturningBuiltin(builtin_name)) {
         return .type_type;
     }
 
@@ -1177,7 +1195,7 @@ fn nodeIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, mo
         .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.varDeclIsTypeRef(tree, node, module_path),
         .identifier => self.identifierIsTypeRef(tree, node, module_path),
         .field_access => self.fieldAccessIsTypeRef(tree, node, module_path),
-        .builtin_call_two, .builtin_call_two_comma => self.builtinCallIsTypeRef(tree, node),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => self.builtinCallIsTypeRef(tree, node),
         .container_decl,
         .container_decl_trailing,
         .container_decl_two,
@@ -1243,10 +1261,7 @@ fn fieldAccessIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.In
 
 fn builtinCallIsTypeRef(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) bool {
     const builtin_name = tree.tokenSlice(tree.nodeMainToken(node));
-    return std.mem.eql(u8, builtin_name, "@import") or
-        std.mem.eql(u8, builtin_name, "@This") or
-        std.mem.eql(u8, builtin_name, "@TypeOf") or
-        std.mem.eql(u8, builtin_name, "@Type");
+    return std.mem.eql(u8, builtin_name, "@import") or isTypeReturningBuiltin(builtin_name);
 }
 
 test "resolve primitive types" {
@@ -1347,6 +1362,63 @@ test "resolve function returns type" {
     const root_decls = tree.rootDecls();
     const type_info = resolver.typeOf(path, root_decls[0]);
     try std.testing.expect(type_info == .type_type);
+}
+
+test "resolve builtin type constructors" {
+    // 0.16 constructors must resolve as types through the resolver too, not
+    // just through Linter's syntactic fallback: with a module graph,
+    // isTypeAlias asks the resolver first.
+    const cases = [_][:0]const u8{
+        "const T = @Int(.unsigned, 8);",
+        "const T = @Vector(4, u8);",
+        "const T = @Tuple(&.{ u8, u16 });",
+        "const T = @FieldType(struct { x: u32 }, \"x\");",
+    };
+    for (cases) |source| {
+        var tree = try Ast.parse(std.testing.allocator, source, .zig);
+        defer tree.deinit(std.testing.allocator);
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+        const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+        defer std.testing.allocator.free(path);
+
+        var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
+        defer graph.deinit();
+
+        var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+        defer resolver.deinit();
+
+        const type_info = resolver.typeOf(path, tree.rootDecls()[0]);
+        try std.testing.expect(type_info == .type_type);
+    }
+}
+
+test "resolve @typeInfo as value, not type" {
+    // @typeInfo returns a std.builtin.Type value; treating it as a type
+    // suppressed Z006 for PascalCase bindings like `const Info = ...`.
+    const source = "const Info = @typeInfo(u8);";
+
+    var tree = try Ast.parse(std.testing.allocator, source, .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const type_info = resolver.typeOf(path, tree.rootDecls()[0]);
+    try std.testing.expect(type_info != .type_type);
 }
 
 test "resolve number literal int" {
